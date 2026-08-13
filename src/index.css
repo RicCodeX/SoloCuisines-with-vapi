@@ -1,0 +1,35 @@
+@import "tailwindcss";
+
+@layer utilities {
+  .font-serif {
+    font-family: 'Cormorant Garamond', Georgia, serif;
+  }
+  .font-sans {
+    font-family: 'Plus Jakarta Sans', system-ui, -apple-system, sans-serif;
+  }
+}
+
+/* Custom scrollbar styling */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-track {
+  background: #f3eee8;
+}
+::-webkit-scrollbar-thumb {
+  background: #c29158;
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #a3723a;
+}
+
+/* Glass & Warm Shadows */
+.warm-shadow {
+  box-shadow: 0 10px 30px -10px rgba(180, 83, 9, 0.08), 0 4px 6px -2px rgba(44, 34, 30, 0.03);
+}
+
+.warm-shadow-hover:hover {
+  box-shadow: 0 20px 40px -15px rgba(180, 83, 9, 0.15), 0 8px 12px -4px rgba(44, 34, 30, 0.06);
+}

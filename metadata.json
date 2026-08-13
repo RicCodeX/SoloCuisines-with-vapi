@@ -1,0 +1,6 @@
+{
+  "name": "SoloCuisines",
+  "description": "Exceptional Nigerian catering and event management services for weddings, corporate gatherings, private parties, and special occasions.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
