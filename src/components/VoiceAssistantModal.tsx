@@ -123,8 +123,6 @@ export const VoiceAssistantModal: React.FC<VoiceAssistantModalProps> = ({ isOpen
     }
   }, [messages, statusText]);
 
-  if (!isOpen) return null;
-
   const isCallActive = callStatus === 'active' || callStatus === 'connecting';
 
   const startCall = async () => {
@@ -191,6 +189,8 @@ export const VoiceAssistantModal: React.FC<VoiceAssistantModalProps> = ({ isOpen
     },
     [inputText]
   );
+
+  if (!isOpen) return null;
 
   return (
     <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-md flex items-center justify-center p-3 sm:p-4 animate-in fade-in duration-200">
