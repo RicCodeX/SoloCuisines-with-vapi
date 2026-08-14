@@ -63,19 +63,24 @@ export const VoiceAssistantModal: React.FC<VoiceAssistantModalProps> = ({ isOpen
   const chatEndRef = useRef<HTMLDivElement>(null);
   const vapiRef = useRef<Vapi | null>(null);
   const callStatusRef = useRef<CallStatus>('idle');
+  // Guards against overlapping start attempts (e.g. double-clicks, or a
+  // typed message arriving while a previous start is still connecting).
+  const startPromiseRef = useRef<Promise<void> | null>(null);
 
-  // Keep a ref in sync so event callbacks (registered once) always see the
-  // latest call status without needing to be re-bound on every render.
+  // Keep a ref in sync so event callbacks always see the latest call status
+  // without needing to be re-bound on every render.
   useEffect(() => {
     callStatusRef.current = callStatus;
   }, [callStatus]);
 
-  // Initialize the Vapi client once on mount.
-  useEffect(() => {
-    if (!VAPI_CONFIGURED) return;
-
+  // Vapi's underlying call engine doesn't reliably support being started a
+  // second time on the same client instance once a prior call has ended —
+  // in practice this shows up as "Meeting has ended" / stuck "Connecting..."
+  // / "KrispSDK is duplicated" errors on retry. So instead of one Vapi
+  // instance for the whole page visit, we build a brand-new one for every
+  // call attempt and discard the old one.
+  const createVapiClient = useCallback((): Vapi => {
     const vapi = new Vapi(VAPI_PUBLIC_KEY as string);
-    vapiRef.current = vapi;
 
     vapi.on('call-start', () => {
       setCallStatus('active');
@@ -128,10 +133,7 @@ export const VoiceAssistantModal: React.FC<VoiceAssistantModalProps> = ({ isOpen
       setCallStatus('idle');
     });
 
-    return () => {
-      vapi.stop();
-      vapiRef.current = null;
-    };
+    return vapi;
   }, []);
 
   useEffect(() => {
@@ -140,14 +142,59 @@ export const VoiceAssistantModal: React.FC<VoiceAssistantModalProps> = ({ isOpen
     }
   }, [messages, statusText]);
 
+  // Stop any live call when the component unmounts (e.g. the modal's parent
+  // is torn down), so a session never keeps running invisibly.
+  useEffect(() => {
+    return () => {
+      vapiRef.current?.stop();
+      vapiRef.current = null;
+    };
+  }, []);
+
   const isCallActive = callStatus === 'active' || callStatus === 'connecting';
 
-  const startCall = async () => {
-    if (!vapiRef.current || !VAPI_CONFIGURED) return;
-    try {
+  // Starts a fresh call. Resolves once the call is actually live (or
+  // rejects on failure/timeout) — callers can safely act right after it
+  // resolves instead of guessing when the connection is ready. If a call is
+  // already active, it resolves immediately without starting a new one.
+  const startCall = useCallback((): Promise<void> => {
+    if (callStatusRef.current === 'active') return Promise.resolve();
+    if (startPromiseRef.current) return startPromiseRef.current;
+    if (!VAPI_CONFIGURED) return Promise.reject(new Error('Vapi is not configured'));
+
+    const promise = new Promise<void>((resolve, reject) => {
+      // Tear down any previous instance before creating a fresh one.
+      vapiRef.current?.stop();
+
+      const vapi = createVapiClient();
+      vapiRef.current = vapi;
+
+      const timeout = setTimeout(() => {
+        cleanup();
+        reject(new Error('Connection timed out. Please try again.'));
+      }, 15000);
+
+      const cleanup = () => {
+        clearTimeout(timeout);
+        vapi.off('call-start', onStart);
+        vapi.off('error', onError);
+      };
+      const onStart = () => {
+        cleanup();
+        resolve();
+      };
+      const onError = (err: any) => {
+        cleanup();
+        reject(err instanceof Error ? err : new Error(toErrorMessage(err, 'Could not start the voice call.')));
+      };
+
+      vapi.on('call-start', onStart);
+      vapi.on('error', onError);
+
       setErrorText(null);
       setCallStatus('connecting');
       setStatusText('Connecting...');
+<<<<<<< Updated upstream
       await vapiRef.current.start(VAPI_ASSISTANT_ID as string);
     } catch (err: any) {
       console.error('Failed to start Vapi call:', err);
@@ -156,6 +203,18 @@ export const VoiceAssistantModal: React.FC<VoiceAssistantModalProps> = ({ isOpen
       setStatusText('Ready to help');
     }
   };
+=======
+
+      vapi.start(VAPI_ASSISTANT_ID as string).catch(onError);
+    });
+
+    startPromiseRef.current = promise.finally(() => {
+      startPromiseRef.current = null;
+    });
+
+    return startPromiseRef.current;
+  }, [createVapiClient]);
+>>>>>>> Stashed changes
 
   const endCall = () => {
     vapiRef.current?.stop();
@@ -169,7 +228,11 @@ export const VoiceAssistantModal: React.FC<VoiceAssistantModalProps> = ({ isOpen
     if (isCallActive) {
       endCall();
     } else {
-      startCall();
+      startCall().catch((err) => {
+        setErrorText(toErrorMessage(err, 'Could not start the voice call. Check mic permissions and try again.'));
+        setCallStatus('idle');
+        setStatusText('Ready to help');
+      });
     }
   };
 
@@ -191,20 +254,23 @@ export const VoiceAssistantModal: React.FC<VoiceAssistantModalProps> = ({ isOpen
         }
       ]);
 
-      if (!VAPI_CONFIGURED || !vapiRef.current) return;
+      if (!VAPI_CONFIGURED) return;
 
-      // A live call is required for the assistant to respond. If one isn't
-      // active yet, start it first, then forward the typed message in.
-      if (callStatusRef.current !== 'active') {
+      try {
+        // A live call is required for the assistant to respond. Waits until
+        // the connection is actually established before sending.
         await startCall();
+        vapiRef.current?.send({
+          type: 'add-message',
+          message: { role: 'user', content: query }
+        });
+      } catch (err) {
+        setErrorText(toErrorMessage(err, 'Could not reach the voice assistant. Please try again.'));
+        setCallStatus('idle');
+        setStatusText('Ready to help');
       }
-
-      vapiRef.current.send({
-        type: 'add-message',
-        message: { role: 'user', content: query }
-      });
     },
-    [inputText]
+    [inputText, startCall]
   );
 
   if (!isOpen) return null;
