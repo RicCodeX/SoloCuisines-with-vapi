@@ -194,16 +194,6 @@ export const VoiceAssistantModal: React.FC<VoiceAssistantModalProps> = ({ isOpen
       setErrorText(null);
       setCallStatus('connecting');
       setStatusText('Connecting...');
-<<<<<<< Updated upstream
-      await vapiRef.current.start(VAPI_ASSISTANT_ID as string);
-    } catch (err: any) {
-      console.error('Failed to start Vapi call:', err);
-      setErrorText(toErrorMessage(err, 'Could not start the voice call. Check mic permissions and try again.'));
-      setCallStatus('idle');
-      setStatusText('Ready to help');
-    }
-  };
-=======
 
       vapi.start(VAPI_ASSISTANT_ID as string).catch(onError);
     });
@@ -214,7 +204,6 @@ export const VoiceAssistantModal: React.FC<VoiceAssistantModalProps> = ({ isOpen
 
     return startPromiseRef.current;
   }, [createVapiClient]);
->>>>>>> Stashed changes
 
   const endCall = () => {
     vapiRef.current?.stop();
