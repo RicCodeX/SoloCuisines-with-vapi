@@ -11,6 +11,23 @@ const VAPI_PUBLIC_KEY = import.meta.env.VITE_VAPI_PUBLIC_KEY as string | undefin
 const VAPI_ASSISTANT_ID = import.meta.env.VITE_VAPI_ASSISTANT_ID as string | undefined;
 const VAPI_CONFIGURED = Boolean(VAPI_PUBLIC_KEY && VAPI_ASSISTANT_ID);
 
+// Vapi's underlying call engine (Daily.co) doesn't always hand back a plain
+// string error — sometimes it's { type, msg, details } or nested under
+// .error. This normalizes any shape into a safe, renderable string so a
+// weird error object can never crash the UI by being rendered directly.
+function toErrorMessage(err: unknown, fallback: string): string {
+  if (!err) return fallback;
+  if (typeof err === 'string') return err;
+  if (err instanceof Error) return err.message || fallback;
+  if (typeof err === 'object') {
+    const anyErr = err as Record<string, any>;
+    const candidate = anyErr.message || anyErr.msg || anyErr.error?.message || anyErr.error?.msg;
+    if (typeof candidate === 'string') return candidate;
+    if (typeof anyErr.type === 'string') return `${anyErr.type}: ${fallback}`;
+  }
+  return fallback;
+}
+
 interface VoiceAssistantModalProps {
   isOpen: boolean;
   onClose: () => void;
@@ -107,7 +124,7 @@ export const VoiceAssistantModal: React.FC<VoiceAssistantModalProps> = ({ isOpen
 
     vapi.on('error', (err: any) => {
       console.error('Vapi error:', err);
-      setErrorText(err?.message || err?.error?.message || 'The voice assistant hit an error. Please try again.');
+      setErrorText(toErrorMessage(err, 'The voice assistant hit a connection glitch. Try Start Voice again.'));
       setCallStatus('idle');
     });
 
@@ -134,7 +151,7 @@ export const VoiceAssistantModal: React.FC<VoiceAssistantModalProps> = ({ isOpen
       await vapiRef.current.start(VAPI_ASSISTANT_ID as string);
     } catch (err: any) {
       console.error('Failed to start Vapi call:', err);
-      setErrorText(err?.message || 'Could not start the voice call. Check mic permissions and try again.');
+      setErrorText(toErrorMessage(err, 'Could not start the voice call. Check mic permissions and try again.'));
       setCallStatus('idle');
       setStatusText('Ready to help');
     }
