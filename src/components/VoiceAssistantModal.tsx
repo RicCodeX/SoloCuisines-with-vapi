@@ -100,6 +100,22 @@ export const VoiceAssistantModal: React.FC<VoiceAssistantModalProps> = ({ isOpen
   const [pendingSender, setPendingSender] = useState<'user' | 'assistant' | null>(null);
   const USER_PAUSE_WINDOW_MS = 1500;
   const ASSISTANT_SAFETY_NET_MS = 8000;
+  // Bumped every time a new Vapi client is created. Each client's event
+  // handlers capture the generation they belong to, so if an old client
+  // isn't fully silenced before a new one starts (e.g. a stray late event
+  // from a connection that was already abandoned), it gets ignored instead
+  // of writing into the current session's messages.
+  const callGenerationRef = useRef(0);
+
+  // Fully detaches a Vapi client so it can never fire another event, then
+  // stops its underlying call. Used whenever we're discarding an instance
+  // (starting a new one, or ending the call), so a slow-to-close previous
+  // session can't leak stray events into whatever comes next.
+  const destroyVapiClient = (vapi: Vapi | null) => {
+    if (!vapi) return;
+    vapi.removeAllListeners();
+    vapi.stop();
+  };
 
   // Commits whatever's been accumulated as one finished chat bubble. Called
   // when a turn definitively ends (assistant's 'speech-end'), when the user
@@ -141,14 +157,18 @@ export const VoiceAssistantModal: React.FC<VoiceAssistantModalProps> = ({ isOpen
   // call attempt and discard the old one.
   const createVapiClient = useCallback((): Vapi => {
     const vapi = new Vapi(VAPI_PUBLIC_KEY as string);
+    const myGeneration = ++callGenerationRef.current;
+    const isCurrent = () => callGenerationRef.current === myGeneration;
 
     vapi.on('call-start', () => {
+      if (!isCurrent()) return;
       setCallStatus('active');
       setStatusText('Listening...');
       setErrorText(null);
     });
 
     vapi.on('call-end', () => {
+      if (!isCurrent()) return;
       setCallStatus('ended');
       setIsAssistantSpeaking(false);
       setVolumeLevel(0);
@@ -159,11 +179,13 @@ export const VoiceAssistantModal: React.FC<VoiceAssistantModalProps> = ({ isOpen
     });
 
     vapi.on('speech-start', () => {
+      if (!isCurrent()) return;
       setIsAssistantSpeaking(true);
       setStatusText('Speaking...');
     });
 
     vapi.on('speech-end', () => {
+      if (!isCurrent()) return;
       setIsAssistantSpeaking(false);
       setStatusText(callStatusRef.current === 'active' ? 'Listening...' : 'Ready to help');
       // The assistant's turn is definitively over — commit its full reply
@@ -174,6 +196,7 @@ export const VoiceAssistantModal: React.FC<VoiceAssistantModalProps> = ({ isOpen
     });
 
     vapi.on('volume-level', (level: number) => {
+      if (!isCurrent()) return;
       setVolumeLevel(level);
     });
 
@@ -182,6 +205,7 @@ export const VoiceAssistantModal: React.FC<VoiceAssistantModalProps> = ({ isOpen
     // joins slightly after call-start, which would otherwise miss an
     // already-requested mute for a text-triggered turn.
     vapi.on('daily-participant-updated', () => {
+      if (!isCurrent()) return;
       setAssistantSubscribed(vapi, assistantAudibleRef.current);
     });
 
@@ -193,6 +217,7 @@ export const VoiceAssistantModal: React.FC<VoiceAssistantModalProps> = ({ isOpen
     // indicator — until the turn is finished, then the whole thing is
     // committed as one bubble.
     vapi.on('message', (message: any) => {
+      if (!isCurrent()) return;
       if (message?.type === 'transcript' && message.transcriptType === 'final' && message.transcript?.trim()) {
         const sender: 'user' | 'assistant' = message.role === 'assistant' ? 'assistant' : 'user';
         const fragment: string = message.transcript.trim();
@@ -234,6 +259,7 @@ export const VoiceAssistantModal: React.FC<VoiceAssistantModalProps> = ({ isOpen
     });
 
     vapi.on('error', (err: any) => {
+      if (!isCurrent()) return;
       console.error('Vapi error:', err);
       setErrorText(toErrorMessage(err, 'The voice assistant hit a connection glitch. Try Start Voice again.'));
       setCallStatus('idle');
@@ -252,7 +278,7 @@ export const VoiceAssistantModal: React.FC<VoiceAssistantModalProps> = ({ isOpen
   // is torn down), so a session never keeps running invisibly.
   useEffect(() => {
     return () => {
-      vapiRef.current?.stop();
+      destroyVapiClient(vapiRef.current);
       vapiRef.current = null;
     };
   }, []);
@@ -269,8 +295,11 @@ export const VoiceAssistantModal: React.FC<VoiceAssistantModalProps> = ({ isOpen
     if (!VAPI_CONFIGURED) return Promise.reject(new Error('Vapi is not configured'));
 
     const promise = new Promise<void>((resolve, reject) => {
-      // Tear down any previous instance before creating a fresh one.
-      vapiRef.current?.stop();
+      // Tear down any previous instance before creating a fresh one — fully
+      // detaching its listeners first so it can't fire a stray late event
+      // (e.g. a connection that finally completes after we've already
+      // timed out and moved on) into the new session's messages.
+      destroyVapiClient(vapiRef.current);
 
       const vapi = createVapiClient();
       vapiRef.current = vapi;
@@ -323,7 +352,7 @@ export const VoiceAssistantModal: React.FC<VoiceAssistantModalProps> = ({ isOpen
   }, [createVapiClient]);
 
   const endCall = () => {
-    vapiRef.current?.stop();
+    destroyVapiClient(vapiRef.current);
     setCallStatus('idle');
     setStatusText('Ready to help');
     setIsAssistantSpeaking(false);
