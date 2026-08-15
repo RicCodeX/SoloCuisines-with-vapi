@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import Vapi from '@vapi-ai/web';
-import { Mic, MicOff, X, Sparkles, Send, PhoneCall, Info, PhoneOff, AlertTriangle } from 'lucide-react';
+import { Mic, MicOff, X, Sparkles, Send, PhoneCall, Info, PhoneOff, AlertTriangle, Type } from 'lucide-react';
 import { BUSINESS_INFO } from '../data/cateringData';
 import { AssistantMessage } from '../types';
 
@@ -26,6 +26,24 @@ function toErrorMessage(err: unknown, fallback: string): string {
     if (typeof anyErr.type === 'string') return `${anyErr.type}: ${fallback}`;
   }
   return fallback;
+}
+
+// Directly controls whether we're subscribed to the assistant's remote audio
+// track via the underlying Daily.co call object. This is more reliable than
+// Vapi's 'mute-assistant' control message (which has known cases of silently
+// not taking effect) — this works at the WebRTC subscription level directly,
+// so it can't be missed or ignored.
+function setAssistantSubscribed(vapi: Vapi, audible: boolean) {
+  const dailyCall = vapi.getDailyCallObject();
+  if (!dailyCall) return;
+  const participants = dailyCall.participants();
+  Object.values(participants).forEach((p: any) => {
+    if (!p.local) {
+      dailyCall.updateParticipant(p.session_id, {
+        setSubscribedTracks: { audio: audible }
+      });
+    }
+  });
 }
 
 interface VoiceAssistantModalProps {
@@ -66,6 +84,48 @@ export const VoiceAssistantModal: React.FC<VoiceAssistantModalProps> = ({ isOpen
   // Guards against overlapping start attempts (e.g. double-clicks, or a
   // typed message arriving while a previous start is still connecting).
   const startPromiseRef = useRef<Promise<void> | null>(null);
+  // Whether the assistant's reply for the CURRENT turn should be audible.
+  // 'voice' turns (the user spoke) play audio as normal; 'text' turns (the
+  // user typed) suppress audio so only a text reply appears — matching
+  // input modality to output modality.
+  const pendingModalityRef = useRef<'voice' | 'text'>('voice');
+  const assistantAudibleRef = useRef<boolean>(true);
+  // Accumulates transcript fragments for whichever speaker currently "has
+  // the floor", out of view — nothing is shown in the chat log until the
+  // turn is finished. While a turn is in progress, pendingSender drives a
+  // chat-app-style "typing/listening" indicator bubble instead of growing
+  // text word by word.
+  const pendingTextRef = useRef<{ sender: 'user' | 'assistant'; text: string } | null>(null);
+  const pendingTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [pendingSender, setPendingSender] = useState<'user' | 'assistant' | null>(null);
+  const USER_PAUSE_WINDOW_MS = 1500;
+  const ASSISTANT_SAFETY_NET_MS = 8000;
+
+  // Commits whatever's been accumulated as one finished chat bubble. Called
+  // when a turn definitively ends (assistant's 'speech-end'), when the user
+  // pauses long enough to assume they're done, or as a safety net so a call
+  // dropping mid-turn never silently loses what was said.
+  const flushPending = useCallback(() => {
+    if (pendingTimeoutRef.current) {
+      clearTimeout(pendingTimeoutRef.current);
+      pendingTimeoutRef.current = null;
+    }
+    const pending = pendingTextRef.current;
+    if (!pending) return;
+    const modality: 'voice' | 'text' = pending.sender === 'user' ? 'voice' : pendingModalityRef.current;
+    setMessages((prev) => [
+      ...prev,
+      {
+        id: `${pending.sender}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+        sender: pending.sender,
+        text: pending.text,
+        timestamp: 'Just now',
+        modality
+      }
+    ]);
+    pendingTextRef.current = null;
+    setPendingSender(null);
+  }, []);
 
   // Keep a ref in sync so event callbacks always see the latest call status
   // without needing to be re-bound on every render.
@@ -86,6 +146,17 @@ export const VoiceAssistantModal: React.FC<VoiceAssistantModalProps> = ({ isOpen
       setCallStatus('active');
       setStatusText('Listening...');
       setErrorText(null);
+
+      // Disable the WASM-based noise-cancellation (Krisp) processor. It's
+      // the source of the "WASM_OR_WORKER_NOT_READY" / Krisp-duplicate
+      // errors that show up specifically on some machines — likely security
+      // software, drivers, or browser policy blocking its worker. The call
+      // works fine without it; this just avoids that whole failure path.
+      const dailyCall = vapi.getDailyCallObject();
+      dailyCall?.updateInputSettings({ audio: { processor: { type: 'none' } } }).catch(() => {
+        // Non-fatal if this fails — the call itself still works, it just
+        // means noise cancellation stays on for this session.
+      });
     });
 
     vapi.on('call-end', () => {
@@ -93,6 +164,9 @@ export const VoiceAssistantModal: React.FC<VoiceAssistantModalProps> = ({ isOpen
       setIsAssistantSpeaking(false);
       setVolumeLevel(0);
       setStatusText('Ready to help');
+      // Don't lose whatever was said right before a drop — commit it.
+      flushPending();
+      assistantAudibleRef.current = true;
     });
 
     vapi.on('speech-start', () => {
@@ -103,27 +177,70 @@ export const VoiceAssistantModal: React.FC<VoiceAssistantModalProps> = ({ isOpen
     vapi.on('speech-end', () => {
       setIsAssistantSpeaking(false);
       setStatusText(callStatusRef.current === 'active' ? 'Listening...' : 'Ready to help');
+      // The assistant's turn is definitively over — commit its full reply
+      // as one finished bubble now.
+      if (pendingTextRef.current?.sender === 'assistant') {
+        flushPending();
+      }
     });
 
     vapi.on('volume-level', (level: number) => {
       setVolumeLevel(level);
     });
 
+    // Re-applies the current desired mute state whenever Daily's participant
+    // list changes — covers the case where the assistant's audio track
+    // joins slightly after call-start, which would otherwise miss an
+    // already-requested mute for a text-triggered turn.
+    vapi.on('daily-participant-updated', () => {
+      setAssistantSubscribed(vapi, assistantAudibleRef.current);
+    });
+
     // Vapi streams both the user's live transcript and the assistant's
-    // response as 'transcript' messages. We only commit the *final* chunks
-    // to the chat log so it doesn't fill up with partial fragments.
+    // response as 'transcript' messages, but the underlying speech engine
+    // emits multiple 'final' chunks per turn (e.g. per short phrase) rather
+    // than one per full utterance. Fragments accumulate in a hidden buffer
+    // — nothing appears in the chat log, just a "listening/typing"
+    // indicator — until the turn is finished, then the whole thing is
+    // committed as one bubble.
     vapi.on('message', (message: any) => {
       if (message?.type === 'transcript' && message.transcriptType === 'final' && message.transcript?.trim()) {
         const sender: 'user' | 'assistant' = message.role === 'assistant' ? 'assistant' : 'user';
-        setMessages((prev) => [
-          ...prev,
-          {
-            id: `${sender}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
-            sender,
-            text: message.transcript,
-            timestamp: 'Just now'
+        const fragment: string = message.transcript.trim();
+
+        // Any live transcript with sender 'user' can only come from actually
+        // speaking (typed messages are added directly, not through this
+        // event) — so this is unambiguous proof of voice input. Make sure
+        // the assistant is audible for the reply, undoing any earlier
+        // text-triggered mute.
+        if (sender === 'user') {
+          pendingModalityRef.current = 'voice';
+          if (!assistantAudibleRef.current) {
+            assistantAudibleRef.current = true;
+            setAssistantSubscribed(vapi, true);
           }
-        ]);
+        }
+
+        if (pendingTimeoutRef.current) clearTimeout(pendingTimeoutRef.current);
+
+        if (pendingTextRef.current && pendingTextRef.current.sender === sender) {
+          pendingTextRef.current.text += ` ${fragment}`;
+        } else {
+          // Speaker changed mid-flight (rare) — commit whatever the
+          // previous speaker had before starting the new buffer.
+          if (pendingTextRef.current) flushPending();
+          pendingTextRef.current = { sender, text: fragment };
+        }
+        setPendingSender(sender);
+
+        // The user has no explicit "finished talking" event, so a pause is
+        // our signal they're done. The assistant is normally closed by
+        // 'speech-end' above; this longer timeout is just a safety net in
+        // case that event doesn't fire for some reason.
+        pendingTimeoutRef.current = setTimeout(
+          flushPending,
+          sender === 'user' ? USER_PAUSE_WINDOW_MS : ASSISTANT_SAFETY_NET_MS
+        );
       }
     });
 
@@ -134,13 +251,13 @@ export const VoiceAssistantModal: React.FC<VoiceAssistantModalProps> = ({ isOpen
     });
 
     return vapi;
-  }, []);
+  }, [flushPending]);
 
   useEffect(() => {
     if (chatEndRef.current) {
       chatEndRef.current.scrollIntoView({ behavior: 'smooth' });
     }
-  }, [messages, statusText]);
+  }, [messages, statusText, pendingSender]);
 
   // Stop any live call when the component unmounts (e.g. the modal's parent
   // is torn down), so a session never keeps running invisibly.
@@ -195,7 +312,18 @@ export const VoiceAssistantModal: React.FC<VoiceAssistantModalProps> = ({ isOpen
       setCallStatus('connecting');
       setStatusText('Connecting...');
 
-      vapi.start(VAPI_ASSISTANT_ID as string).catch(onError);
+      // Pass these directly rather than relying solely on the assistant's
+      // dashboard settings — Vapi has a known issue where dashboard-saved
+      // silenceTimeoutSeconds/maxDurationSeconds don't always take effect,
+      // silently falling back to short defaults (as little as ~10-30s of
+      // silence, or a 10-minute cap). Overriding them here at call-start
+      // time is authoritative regardless of what's saved on the dashboard.
+      vapi
+        .start(VAPI_ASSISTANT_ID as string, {
+          silenceTimeoutSeconds: 120,
+          maxDurationSeconds: 1800
+        })
+        .catch(onError);
     });
 
     startPromiseRef.current = promise.finally(() => {
@@ -232,14 +360,20 @@ export const VoiceAssistantModal: React.FC<VoiceAssistantModalProps> = ({ isOpen
 
       setInputText('');
 
-      // Show the typed message immediately in the transcript.
+      // Show the typed message immediately in the transcript. Flush any
+      // in-progress spoken bubble first so it never gets mixed up with
+      // this typed exchange.
+      flushPending();
+      pendingModalityRef.current = 'text';
+
       setMessages((prev) => [
         ...prev,
         {
           id: `user-${Date.now()}`,
           sender: 'user',
           text: query,
-          timestamp: 'Just now'
+          timestamp: 'Just now',
+          modality: 'text'
         }
       ]);
 
@@ -249,6 +383,12 @@ export const VoiceAssistantModal: React.FC<VoiceAssistantModalProps> = ({ isOpen
         // A live call is required for the assistant to respond. Waits until
         // the connection is actually established before sending.
         await startCall();
+
+        // Typed input should get a text-only reply — suppress the
+        // assistant's audio for this turn so it doesn't also speak aloud.
+        assistantAudibleRef.current = false;
+        if (vapiRef.current) setAssistantSubscribed(vapiRef.current, false);
+
         vapiRef.current?.send({
           type: 'add-message',
           message: { role: 'user', content: query }
@@ -259,7 +399,7 @@ export const VoiceAssistantModal: React.FC<VoiceAssistantModalProps> = ({ isOpen
         setStatusText('Ready to help');
       }
     },
-    [inputText, startCall]
+    [inputText, startCall, flushPending]
   );
 
   if (!isOpen) return null;
@@ -384,7 +524,20 @@ export const VoiceAssistantModal: React.FC<VoiceAssistantModalProps> = ({ isOpen
                 <p>{msg.text}</p>
               </div>
 
-              <span className="text-[10px] text-stone-500 mt-1 px-1">{msg.timestamp}</span>
+              <span className="text-[10px] text-stone-500 mt-1 px-1 flex items-center gap-1">
+                {msg.timestamp}
+                {msg.modality && (
+                  <span className="inline-flex items-center gap-0.5 text-stone-500">
+                    &middot;
+                    {msg.modality === 'voice' ? (
+                      <Mic className="w-2.5 h-2.5" />
+                    ) : (
+                      <Type className="w-2.5 h-2.5" />
+                    )}
+                    {msg.modality === 'voice' ? 'Voice' : 'Text'}
+                  </span>
+                )}
+              </span>
 
               {/* Preset Suggestions */}
               {msg.suggestedQuestions && msg.suggestedQuestions.length > 0 && (
@@ -402,6 +555,31 @@ export const VoiceAssistantModal: React.FC<VoiceAssistantModalProps> = ({ isOpen
               )}
             </div>
           ))}
+
+          {/* Listening/typing indicator — shown while a turn is in progress
+              instead of growing partial text, chat-app style. */}
+          {pendingSender && (
+            <div className={`flex flex-col ${pendingSender === 'user' ? 'items-end' : 'items-start'}`}>
+              <div
+                className={`px-4 py-3 rounded-2xl flex items-center gap-1 ${
+                  pendingSender === 'user'
+                    ? 'bg-[#B45309]/60 rounded-br-none'
+                    : 'bg-stone-900 border border-amber-900/30 rounded-bl-none'
+                }`}
+              >
+                {[0, 1, 2].map((i) => (
+                  <span
+                    key={i}
+                    className="w-1.5 h-1.5 rounded-full bg-amber-300/80 animate-bounce"
+                    style={{ animationDelay: `${i * 0.15}s` }}
+                  ></span>
+                ))}
+              </div>
+              <span className="text-[10px] text-stone-500 mt-1 px-1">
+                {pendingSender === 'user' ? 'Listening...' : 'Responding...'}
+              </span>
+            </div>
+          )}
 
           <div ref={chatEndRef} />
         </div>

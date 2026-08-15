@@ -109,4 +109,5 @@ export interface AssistantMessage {
   text: string;
   timestamp: string;
   suggestedQuestions?: string[];
+  modality?: 'voice' | 'text';
 }
