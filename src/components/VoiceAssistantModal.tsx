@@ -28,21 +28,17 @@ function toErrorMessage(err: unknown, fallback: string): string {
   return fallback;
 }
 
-// Directly controls whether we're subscribed to the assistant's remote audio
-// track via the underlying Daily.co call object. This is more reliable than
-// Vapi's 'mute-assistant' control message (which has known cases of silently
-// not taking effect) — this works at the WebRTC subscription level directly,
-// so it can't be missed or ignored.
-function setAssistantSubscribed(vapi: Vapi, audible: boolean) {
-  const dailyCall = vapi.getDailyCallObject();
-  if (!dailyCall) return;
-  const participants = dailyCall.participants();
-  Object.values(participants).forEach((p: any) => {
-    if (!p.local) {
-      dailyCall.updateParticipant(p.session_id, {
-        setSubscribedTracks: { audio: audible }
-      });
-    }
+// Mutes/unmutes the assistant's audio locally, in the browser only. Vapi
+// (via Daily) plays remote audio through an <audio> element it manages
+// automatically — muting that element just silences local playback without
+// touching the underlying WebRTC subscription. This matters: unsubscribing
+// from the track at the connection level (an earlier approach) risked Vapi's
+// server reading "not receiving media" as a broken client and ending the
+// call early — exactly the kind of short-lived, greeting-only call seen
+// when muting kicked in immediately after connecting for a typed message.
+function setAssistantAudioMuted(muted: boolean) {
+  document.querySelectorAll('audio').forEach((el) => {
+    (el as HTMLAudioElement).muted = muted;
   });
 }
 
@@ -176,6 +172,7 @@ export const VoiceAssistantModal: React.FC<VoiceAssistantModalProps> = ({ isOpen
       // Don't lose whatever was said right before a drop — commit it.
       flushPending();
       assistantAudibleRef.current = true;
+      setAssistantAudioMuted(false);
     });
 
     vapi.on('speech-start', () => {
@@ -200,15 +197,6 @@ export const VoiceAssistantModal: React.FC<VoiceAssistantModalProps> = ({ isOpen
       setVolumeLevel(level);
     });
 
-    // Re-applies the current desired mute state whenever Daily's participant
-    // list changes — covers the case where the assistant's audio track
-    // joins slightly after call-start, which would otherwise miss an
-    // already-requested mute for a text-triggered turn.
-    vapi.on('daily-participant-updated', () => {
-      if (!isCurrent()) return;
-      setAssistantSubscribed(vapi, assistantAudibleRef.current);
-    });
-
     // Vapi streams both the user's live transcript and the assistant's
     // response as 'transcript' messages, but the underlying speech engine
     // emits multiple 'final' chunks per turn (e.g. per short phrase) rather
@@ -231,7 +219,7 @@ export const VoiceAssistantModal: React.FC<VoiceAssistantModalProps> = ({ isOpen
           pendingModalityRef.current = 'voice';
           if (!assistantAudibleRef.current) {
             assistantAudibleRef.current = true;
-            setAssistantSubscribed(vapi, true);
+            setAssistantAudioMuted(false);
           }
         }
 
@@ -273,6 +261,29 @@ export const VoiceAssistantModal: React.FC<VoiceAssistantModalProps> = ({ isOpen
       chatEndRef.current.scrollIntoView({ behavior: 'smooth' });
     }
   }, [messages, statusText, pendingSender]);
+
+  // Daily creates the <audio> element for the assistant's remote track only
+  // once that track actually arrives, which can be a beat after call-start.
+  // Watch for it so a text-triggered mute set right at call-start still
+  // applies correctly instead of racing a not-yet-existing element.
+  useEffect(() => {
+    const observer = new MutationObserver((mutations) => {
+      if (assistantAudibleRef.current) return;
+      for (const mutation of mutations) {
+        mutation.addedNodes.forEach((node) => {
+          if (node instanceof HTMLAudioElement) {
+            node.muted = true;
+          } else if (node instanceof HTMLElement) {
+            node.querySelectorAll('audio').forEach((el) => {
+              (el as HTMLAudioElement).muted = true;
+            });
+          }
+        });
+      }
+    });
+    observer.observe(document.body, { childList: true, subtree: true });
+    return () => observer.disconnect();
+  }, []);
 
   // Stop any live call when the component unmounts (e.g. the modal's parent
   // is torn down), so a session never keeps running invisibly.
@@ -403,9 +414,10 @@ export const VoiceAssistantModal: React.FC<VoiceAssistantModalProps> = ({ isOpen
         await startCall();
 
         // Typed input should get a text-only reply — suppress the
-        // assistant's audio for this turn so it doesn't also speak aloud.
+        // assistant's audio locally for this turn so it doesn't also speak
+        // aloud, without touching the underlying connection.
         assistantAudibleRef.current = false;
-        if (vapiRef.current) setAssistantSubscribed(vapiRef.current, false);
+        setAssistantAudioMuted(true);
 
         vapiRef.current?.send({
           type: 'add-message',
