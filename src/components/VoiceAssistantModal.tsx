@@ -146,17 +146,6 @@ export const VoiceAssistantModal: React.FC<VoiceAssistantModalProps> = ({ isOpen
       setCallStatus('active');
       setStatusText('Listening...');
       setErrorText(null);
-
-      // Disable the WASM-based noise-cancellation (Krisp) processor. It's
-      // the source of the "WASM_OR_WORKER_NOT_READY" / Krisp-duplicate
-      // errors that show up specifically on some machines — likely security
-      // software, drivers, or browser policy blocking its worker. The call
-      // works fine without it; this just avoids that whole failure path.
-      const dailyCall = vapi.getDailyCallObject();
-      dailyCall?.updateInputSettings({ audio: { processor: { type: 'none' } } }).catch(() => {
-        // Non-fatal if this fails — the call itself still works, it just
-        // means noise cancellation stays on for this session.
-      });
     });
 
     vapi.on('call-end', () => {
